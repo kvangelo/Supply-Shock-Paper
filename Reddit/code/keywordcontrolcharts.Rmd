@@ -1,0 +1,173 @@
+---
+title: "Keyword Control Charts - Simplified"
+author: "Kasey Vangelov"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Load Libraries
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(zoo)
+```
+
+## Setup Parameters
+```{r parameters}
+# Date parameters
+clip_start <- as.Date("2021-01-01")
+clip_end   <- as.Date("2024-12-31")
+split_date <- as.Date("2023-07-01")
+ban_dates  <- as.Date(c("2024-01-19", "2024-11-03"))
+
+# Create output directory
+dir.create("keyword_control_charts", showWarnings = FALSE, recursive = TRUE)
+```
+
+## Read Monthly Keyword Data
+```{r read-data}
+# Read the pre-computed monthly keyword table
+monthly_data <- read_csv("fentanyl_reddit_monthly_keywords.csv", show_col_types = FALSE)
+
+# Ensure month column is Date format
+monthly_data <- monthly_data %>%
+  mutate(month = as.Date(month))
+
+cat("✓ Loaded monthly keyword data\n")
+cat("  Date range:", min(monthly_data$month), "to", max(monthly_data$month), "\n")
+cat("  Total months:", nrow(monthly_data), "\n")
+```
+
+## Calculate Control Chart Statistics
+```{r calculate-control-limits}
+# Function to add rolling statistics and control limits
+add_control_limits <- function(df, keyword_col) {
+  df %>%
+    filter(month >= clip_start & month <= clip_end) %>%
+    arrange(month) %>%
+    mutate(
+      # Calculate rolling mean (6-month window)
+      roll_mean = rollmean(!!sym(keyword_col), k = 6, fill = NA, align = "right"),
+      # Calculate rolling SD (6-month window)
+      roll_sd = rollapply(!!sym(keyword_col), width = 6, FUN = sd, fill = NA, align = "right"),
+      # Calculate control limits
+      upper_3sd = roll_mean + 3 * roll_sd,
+      lower_3sd = pmax(roll_mean - 3 * roll_sd, 0),
+      # Calculate pre-July 2023 averages for frozen limits
+      pre_mean_avg = mean(roll_mean[month < split_date], na.rm = TRUE),
+      pre_sd_avg = mean(roll_sd[month < split_date], na.rm = TRUE),
+      # Apply frozen limits after split_date
+      upper_3sd = if_else(month >= split_date, pre_mean_avg + 3 * pre_sd_avg, upper_3sd),
+      lower_3sd = if_else(month >= split_date, pmax(pre_mean_avg - 3 * pre_sd_avg, 0), lower_3sd)
+    )
+}
+```
+
+## Generate Control Charts for All Keywords
+```{r generate-charts, results='asis', fig.width=10, fig.height=6}
+# Define keyword columns to analyze (exclude total_posts and percentage columns)
+keyword_cols <- c(
+  "drought",
+  "shortage", 
+  "drought_shortage_misspellings",
+  "out_of_stock",
+  "poor_quality_unavailable",
+  "weak_bunk",
+  "hard_to_get"
+)
+
+# Create nice labels for titles
+keyword_labels <- c(
+  drought = "Drought",
+  shortage = "Shortage",
+  drought_shortage_misspellings = "Drought/Shortage (with misspellings)",
+  out_of_stock = "Out of Stock",
+  poor_quality_unavailable = "Poor Quality/Unavailable",
+  weak_bunk = "Weak/Bunk",
+  hard_to_get = "Hard to Get"
+)
+
+# Get total posts for captions
+N_total <- sum(monthly_data$total_posts)
+
+# Loop through each keyword and create chart
+for (keyword in keyword_cols) {
+  cat("\n\n### ", keyword_labels[keyword], "\n\n")
+  
+  # Prepare data with control limits
+  plot_data <- add_control_limits(monthly_data, keyword)
+  
+  # Get total keyword hits for caption
+  keyword_total <- sum(monthly_data[[keyword]], na.rm = TRUE)
+  
+  # Create caption
+  custom_caption <- paste0(
+    "N = ", format(N_total, big.mark = ","),
+    " total posts analyzed (Jan 2021 – Dec 2024); ",
+    format(keyword_total, big.mark = ","),
+    " posts mention keyword. ",
+    "Red lines mark moderator bans of drought discussions."
+  )
+  
+  # Create plot
+  p <- ggplot(plot_data, aes(x = month, y = !!sym(keyword))) +
+    geom_line(color = "black", linewidth = 1) +
+    geom_line(aes(y = upper_3sd), color = "grey50", linetype = "dotted", linewidth = 0.8) +
+    geom_line(aes(y = lower_3sd), color = "grey50", linetype = "dotted", linewidth = 0.8) +
+    geom_vline(xintercept = as.numeric(ban_dates), color = "red",
+               linetype = "dotted", linewidth = 0.8, alpha = 0.8) +
+    scale_x_date(limits = c(clip_start, clip_end)) +
+    labs(
+      title = paste("Monthly Usage of", keyword_labels[keyword], "– fentanyl_reddit"),
+      subtitle = "Control chart with frozen ±3 SD bounds after July 2023",
+      caption = custom_caption,
+      x = NULL,
+      y = "Count of posts"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      plot.caption = element_text(size = 10, color = "grey30", hjust = 0)
+    )
+  
+  # Save plot
+  filename <- paste0("keyword_control_charts/", keyword, "_control_chart.png")
+  ggsave(filename, p, width = 10, height = 6, dpi = 300)
+  
+  # Display plot in document
+  print(p)
+  
+  cat("\n✓ Saved:", filename, "\n")
+}
+```
+
+## Summary Table
+```{r summary-table}
+# Create summary statistics table
+summary_stats <- data.frame(
+  Keyword = keyword_labels[keyword_cols],
+  Total_Mentions = sapply(keyword_cols, function(k) sum(monthly_data[[k]], na.rm = TRUE)),
+  Avg_Monthly = sapply(keyword_cols, function(k) round(mean(monthly_data[[k]], na.rm = TRUE), 1)),
+  Max_Monthly = sapply(keyword_cols, function(k) max(monthly_data[[k]], na.rm = TRUE)),
+  Pct_of_Posts = sapply(keyword_cols, function(k) 
+    round(100 * sum(monthly_data[[k]], na.rm = TRUE) / N_total, 2))
+)
+
+knitr::kable(summary_stats, 
+             col.names = c("Keyword Category", "Total Mentions", "Avg Monthly", "Max Monthly", "% of All Posts"),
+             format.args = list(big.mark = ","))
+```
+
+## Notes
+
+- Control limits are calculated using a 6-month rolling window
+- Limits are "frozen" after July 2023 using pre-July 2023 average statistics
+- Red vertical lines mark January 19, 2024 and November 3, 2024 (moderator bans)
+- All charts saved to `keyword_control_charts/` directory
